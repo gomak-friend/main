@@ -1,0 +1,211 @@
+import datetime
+import os
+import re
+
+def is_korean(text):
+    return bool(re.search('[\u3131-\u3163\uac00-\ud7a3]+', text))
+
+def is_korean_track(track):
+    return is_korean(track['name']) or is_korean(track['artists'][0]['name'])
+
+INDIE_KEYWORDS = [
+    # 🇰🇷 한국어 키워드
+    '인디', '밴드', '자작곡', '싱어송라이터', '홍대', '언플러그드',
+    '혼자', '어쿠스틱', '비주류', '마이너', '자유', '자유로운', '실험적',
+
+    # 🇬🇧🇺🇸 영어 키워드
+    'indie', 'band', 'diy', 'singer-songwriter', 'lofi', 'bedroom',
+    'alternative', 'alt', 'underground', 'unplugged', 'acoustic',
+    'experimental', 'non-mainstream', 'offbeat', 'authentic', 'raw'
+]
+
+def is_moody(track, playlists):
+    name = track['name'].lower()
+    artist = track['artists'][0]['name'].lower()
+    combined_text = name + " " + artist
+    for pl in playlists:
+        combined_text += " " + pl.get('name', '').lower()
+    return any(keyword in combined_text for keyword in INDIE_KEYWORDS)
+
+def get_current_or_input_track(sp):
+    current_track = sp.current_user_playing_track()
+    if current_track is None or current_track['item'] is None:
+        print("현재 재생 중인 곡이 없어요.")
+        track_name = input("추천하고 싶은 곡 제목을 입력해주세요: ").strip()
+        results = sp.search(q=track_name, type='track', limit=5)
+        items = results['tracks']['items']
+
+        if not items:
+            print("해당 제목의 곡을 찾을 수 없어요.")
+            exit()
+
+        print("\n검색 결과:")
+        for i, item in enumerate(items):
+            print(f"{i+1}. {item['name']} - {item['artists'][0]['name']}")
+
+        selected_index = input("\n 정확한 곡을 선택하려면 번호를 입력해주세요 (예: 1): ").strip()
+        if not selected_index.isdigit() or not (1 <= int(selected_index) <= len(items)):
+            print("잘못된 입력이에요. 숫자를 정확히 입력해 주세요.")
+            exit()
+
+        return items[int(selected_index) - 1]
+    return current_track['item']
+
+def search_playlists(sp, artist_name):
+    playlist_results = sp.search(q=artist_name, type='playlist', limit=20)
+    playlist_items = list(filter(None, playlist_results.get('playlists', {}).get('items', [])))
+
+    def sort_priority(pl):
+        title = pl.get('name', '').lower()
+        return (0 if '인디' in title else 1, title)
+
+    sorted_playlists = sorted(playlist_items, key=sort_priority)
+    selected = sorted_playlists[:5]
+
+    if selected:
+        print("\n 선택된 플레이리스트:")
+        for i, pl in enumerate(selected, 1):
+            print(f"{i}. {pl['name']} (by {pl['owner']['display_name']})")
+    else:
+        print("관련 플레이리스트를 찾을 수 없어요. 인디 음악을 추천해드릴게요")
+
+    return selected
+
+
+def fetch_tracks_from_playlists(sp, playlists, exclude_id):
+    all_tracks = []
+    for pl in playlists:
+        pid = pl['id']
+        try:
+            items = sp.playlist_tracks(pid)['items']
+        except Exception as e:
+            print(f" 플레이리스트 불러오기 실패: {e}")
+            continue
+
+        for item in items:
+            track_info = item.get('track')
+            if not track_info or track_info['id'] == exclude_id:
+                continue
+            all_tracks.append(track_info)
+
+    unique_tracks = {t['id']: t for t in all_tracks}.values()
+    filtered_tracks = [t for t in unique_tracks if t.get('popularity', 0) >= 3]
+    return sorted(filtered_tracks, key=lambda x: x.get('popularity', 0))
+
+def find_moody_korean_track(tracks, playlists):
+    # 1순위: 인디 느낌 + 한국어
+    for track in tracks:
+        if is_korean_track(track) and is_moody(track, playlists):
+            return track
+
+    # 2순위: 인디 느낌 (한국어 아님)
+    for track in tracks:
+        if is_moody(track, playlists):
+            return track
+
+    # 3순위: 한국어 (인디 느낌 아님)
+    for track in tracks:
+        if is_korean_track(track):
+            return track
+
+     # 4순위: 아무거나 인기도 낮은 거라도
+    if tracks:
+        return tracks[0]  # popularity 기준으로 정렬되어 있으니까 첫 번째가 가장 인기 낮은 곡
+
+    # 아무것도 없으면
+    return None
+
+
+def find_or_create_playlist(sp, user_id, name, description):
+    playlists = sp.current_user_playlists()['items']
+    for pl in playlists:
+        if pl['name'] == name:
+            return pl['id']
+    new_pl = sp.user_playlist_create(user_id, name, False, description)
+    return new_pl['id']
+
+def save_to_playlist(sp, user_id, track):
+    playlist_name = "고막친구🧸🎵"
+    playlist_description = "고막친구가 추천한 인디 보석들 💎"
+    playlist_id = find_or_create_playlist(sp, user_id, playlist_name, playlist_description)
+    track_uri = f"spotify:track:{track['id']}"
+
+    # 1. 중복 여부 확인
+    is_duplicate = False
+    offset = 0
+    while True:
+        response = sp.playlist_items(
+            playlist_id,
+            offset=offset,
+            fields="items.track.id,total",
+            additional_types=['track']
+        )
+        items = response.get('items', [])
+        if not items:
+            break
+
+        for item in items:
+            existing_track = item.get('track')
+            if existing_track and existing_track['id'] == track['id']:
+                is_duplicate = True
+                break
+        if is_duplicate or offset >= response['total']:
+            break
+        offset += len(items)
+
+    # 2. 사용자에게 재생목록 저장 여부 확인 (중복이 아닐 때만)
+    if is_duplicate:
+        print("🔁 이미 재생목록에 있는 곡입니다. 중복 저장하지 않습니다.")
+    else:
+        answer = input("\n이 곡을 재생목록에 저장할까요? (Y/N): ").strip().lower()
+        if answer == 'y':
+            sp.playlist_add_items(playlist_id, [track_uri])
+            print("✅ 추천곡이 재생목록에 저장되었습니다!")
+        else:
+            print("저장하지 않았습니다. 다음 추천곡도 기대해주세요!")
+
+    # 3. 로그는 항상 저장
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    today = datetime.date.today().isoformat()
+    log_path = os.path.join(log_dir, f"recommendation_log_{today}.txt")
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n")
+        f.write(f"제목      : {track['name']}\n")
+        f.write(f"아티스트 : {track['artists'][0]['name']}\n")
+        f.write(f"인기도    : {track.get('popularity', 'N/A')}\n")
+        f.write(f"중복 여부 : {'중복' if is_duplicate else '신규'}\n")
+        f.write(f"링크      : {track['external_urls']['spotify']}\n")
+        f.write("=" * 40 + "\n")
+
+def main(sp):
+    track = get_current_or_input_track(sp)
+    track_name = track['name']
+    artist_name = track['artists'][0]['name']
+    track_id = track['id']
+
+    print(f"\n 기준 트랙: {track_name} / 아티스트: {artist_name} / ID: {track_id}")
+
+    selected_playlists = search_playlists(sp, artist_name)
+    sorted_tracks = fetch_tracks_from_playlists(sp, selected_playlists, track_id)
+    track_to_recommend = find_moody_korean_track(sorted_tracks, selected_playlists)
+
+    print("\n 인디음악을 찾고 있어요 ..\n") # (인기도 낮은 한국어 곡을)
+
+    if track_to_recommend:
+        name = track_to_recommend['name']
+        artist = track_to_recommend['artists'][0]['name']
+        popularity = track_to_recommend.get('popularity', 'N/A')
+        link = track_to_recommend['external_urls']['spotify']
+
+        print(" 추천 곡 ")
+        print(f"제목      : {name}")
+        print(f"아티스트 : {artist}")
+        print(f"인기도    : {popularity}")
+        print(f"Spotify에서 듣기 -> {link} \n")
+
+        user_id = sp.current_user()['id']
+        save_to_playlist(sp, user_id, track_to_recommend)
+    else:
+        print("추천할 곡이 없어요. 다음엔 더 좋은 곡을 찾아볼게요!")
